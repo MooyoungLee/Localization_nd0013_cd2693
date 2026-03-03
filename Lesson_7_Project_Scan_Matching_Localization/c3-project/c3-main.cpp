@@ -12,7 +12,7 @@
 
 #include <carla/client/Vehicle.h>
 
-//pcl code
+// PCL helpers
 //#include "render/render.h"
 
 namespace cc = carla::client;
@@ -34,6 +34,7 @@ using namespace std;
 #include <sstream>
 #include <chrono> 
 #include <ctime> 
+#include <cmath>
 #include <pcl/registration/icp.h>
 #include <pcl/registration/ndt.h>
 #include <pcl/console/time.h>   // TicToc
@@ -115,9 +116,9 @@ int main(){
 	auto transform = map->GetRecommendedSpawnPoints()[1];
 	auto ego_actor = world.SpawnActor((*vehicles)[12], transform);
 
-	//Create lidar
+	// Configure lidar sensor.
 	auto lidar_bp = *(blueprint_library->Find("sensor.lidar.ray_cast"));
-	// CANDO: Can modify lidar values to get different scan resolutions
+	// You can tune these attributes to change scan density and coverage.
 	lidar_bp.SetAttribute("upper_fov", "15");
     lidar_bp.SetAttribute("lower_fov", "-25");
     lidar_bp.SetAttribute("channels", "32");
@@ -163,7 +164,7 @@ int main(){
 	// Stop when transform update between iterations is sufficiently small.
 	ndt.setTransformationEpsilon(0.01);
 	// Hard cap for runtime per scan match.
-	ndt.setMaximumIterations(20);
+	ndt.setMaximumIterations(30);
 
 	lidar->Listen([&new_scan, &scan_mutex, &lastScanTime, &scanCloud](auto data){
 
@@ -172,10 +173,16 @@ int main(){
 			auto scan = boost::static_pointer_cast<csd::LidarMeasurement>(data);
 			for (auto detection : *scan){
 				if((detection.x*detection.x + detection.y*detection.y + detection.z*detection.z) > 8.0){
-					pclCloud.points.push_back(PointT(detection.x, detection.y, detection.z));
+					// CARLA lidar axes to project/map convention used by this project.
+					const float px = -detection.y;
+					const float py = detection.x;
+					const float pz = -detection.z;
+					if (std::isfinite(px) && std::isfinite(py) && std::isfinite(pz)) {
+						pclCloud.points.push_back(PointT(px, py, pz));
+					}
 				}
 			}
-			if(pclCloud.points.size() > 5000){ // CANDO: Can modify this value to get different scan resolutions
+			if(pclCloud.points.size() > 5000){ // Batch size for each scan-matching update.
 				lastScanTime = std::chrono::system_clock::now();
 				*scanCloud = pclCloud;
 				new_scan = false;
@@ -246,15 +253,15 @@ int main(){
 				continue;
 			}
 
-			// TODO: Voxel downsample the incoming scan before scan matching for speed and robustness.
+			// Downsample the raw scan to keep registration fast and reduce noise.
 			pcl::VoxelGrid<PointT> voxelFilter;
 			voxelFilter.setInputCloud(currentScan);
 			voxelFilter.setLeafSize(0.2f, 0.2f, 0.2f);
 			voxelFilter.filter(*cloudFiltered);
 			currentScan.swap(cloudFiltered);
 
-			// Build an initial transform guess from the previous pose estimate.
-			// A good seed reduces NDT iterations and prevents local minima.
+			// Build the initial registration guess from the last estimated pose.
+			// A strong seed improves convergence speed and stability.
 			Eigen::Matrix4f initialGuess = Eigen::Matrix4f::Identity();
 			const float cy = static_cast<float>(cos(pose.rotation.yaw));
 			const float sy = static_cast<float>(sin(pose.rotation.yaw));
@@ -266,15 +273,17 @@ int main(){
 			initialGuess(1, 3) = static_cast<float>(pose.position.y);
 			initialGuess(2, 3) = static_cast<float>(pose.position.z);
 
-			// Align current lidar scan (source) to map (target) using NDT.
-			// alignedCloud receives the transformed source points.
+			// Register current scan (source) against the static map (target) via NDT.
+			// The aligned output cloud is stored in `alignedCloud`.
 			ndt.setInputSource(currentScan);
 			ndt.align(*alignedCloud, initialGuess);
 			const bool ndtConverged = ndt.hasConverged();
+			const double ndtFitness = ndt.getFitnessScore();
+			const bool ndtValid = ndtConverged && std::isfinite(ndtFitness) && ndtFitness < 2.5;
 
-			// Use the computed NDT transform for localization state.
+			// Accept NDT output only when both convergence and fitness checks pass.
 			Eigen::Matrix4f matchTransform = initialGuess;
-			if (ndtConverged) {
+			if (ndtValid) {
 				matchTransform = ndt.getFinalTransformation();
 			}
 
@@ -283,20 +292,8 @@ int main(){
 			pose.position.z = matchTransform(2, 3);
 			pose.rotation.yaw = atan2(matchTransform(1, 0), matchTransform(0, 0));
 
-			// Step 3: Transform filtered scan into map/world frame and render transformed cloud.
-			// If NDT does not converge, use true ego pose so scan still follows the moving vehicle.
-			Eigen::Matrix4f renderTransform = matchTransform;
-			if (!ndtConverged) {
-				renderTransform = Eigen::Matrix4f::Identity();
-				renderTransform(0, 0) = static_cast<float>(cos(truePose.rotation.yaw));
-				renderTransform(0, 1) = static_cast<float>(-sin(truePose.rotation.yaw));
-				renderTransform(1, 0) = static_cast<float>(sin(truePose.rotation.yaw));
-				renderTransform(1, 1) = static_cast<float>(cos(truePose.rotation.yaw));
-				renderTransform(0, 3) = static_cast<float>(truePose.position.x);
-				renderTransform(1, 3) = static_cast<float>(truePose.position.y);
-				renderTransform(2, 3) = static_cast<float>(truePose.position.z);
-			}
-			pcl::transformPointCloud(*currentScan, *transformedScan, renderTransform);
+			// Step 3: Transform the filtered scan with the estimated pose and render it.
+			pcl::transformPointCloud(*currentScan, *transformedScan, matchTransform);
 			viewer->removePointCloud("scan");
 			renderPointCloud(viewer, transformedScan, "scan", Color(1,0,0) );
 

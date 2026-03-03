@@ -29,6 +29,7 @@ using namespace std;
 #include <pcl/visualization/pcl_visualizer.h>
 #include <pcl/filters/voxel_grid.h>
 #include <pcl/filters/filter.h>
+#include <pcl/filters/passthrough.h>
 #include <pcl/common/transforms.h>
 #include "helper.h"
 #include <sstream>
@@ -36,7 +37,6 @@ using namespace std;
 #include <ctime> 
 #include <cmath>
 #include <pcl/registration/icp.h>
-#include <pcl/registration/ndt.h>
 #include <pcl/console/time.h>   // TicToc
 
 PointCloudT pclCloud;
@@ -153,18 +153,14 @@ int main(){
 	typename pcl::PointCloud<PointT>::Ptr scanCloud (new pcl::PointCloud<PointT>);
 	typename pcl::PointCloud<PointT>::Ptr alignedCloud (new pcl::PointCloud<PointT>);
 	typename pcl::PointCloud<PointT>::Ptr transformedScan (new pcl::PointCloud<PointT>);
-	// NDT is configured once and reused each frame to avoid repeated allocator/setup overhead.
-	// The target is the static map point cloud; each incoming scan becomes the source.
-	pcl::NormalDistributionsTransform<PointT, PointT> ndt;
-	ndt.setInputTarget(mapCloud);
-	// Resolution controls voxel size of NDT cells in meters.
-	ndt.setResolution(1.5);
-	// Step size limits line-search updates during optimization.
-	ndt.setStepSize(0.2);
-	// Stop when transform update between iterations is sufficiently small.
-	ndt.setTransformationEpsilon(0.05);
-	// Hard cap for runtime per scan match.
-	ndt.setMaximumIterations(12);
+	typename pcl::PointCloud<PointT>::Ptr localMapX (new pcl::PointCloud<PointT>);
+	typename pcl::PointCloud<PointT>::Ptr localMapCloud (new pcl::PointCloud<PointT>);
+	// Keep ICP object alive across frames to avoid repeated setup cost.
+	pcl::IterativeClosestPoint<PointT, PointT> icp;
+	icp.setMaximumIterations(12);
+	icp.setMaxCorrespondenceDistance(2.5);
+	icp.setTransformationEpsilon(1e-4);
+	icp.setEuclideanFitnessEpsilon(1e-3);
 
 	lidar->Listen([&new_scan, &scan_mutex, &lastScanTime, &scanCloud](auto data){
 
@@ -273,18 +269,34 @@ int main(){
 			initialGuess(1, 3) = static_cast<float>(pose.position.y);
 			initialGuess(2, 3) = static_cast<float>(pose.position.z);
 
-			// Register current scan (source) against the static map (target) via NDT.
-			// The aligned output cloud is stored in `alignedCloud`.
-			ndt.setInputSource(currentScan);
-			ndt.align(*alignedCloud, initialGuess);
-			const bool ndtConverged = ndt.hasConverged();
-			const double ndtFitness = ndt.getFitnessScore();
-			const bool ndtValid = ndtConverged && std::isfinite(ndtFitness) && ndtFitness < 3.5;
+			// Crop a local map window around the current estimate so ICP matches faster and more reliably.
+			pcl::PassThrough<PointT> passX;
+			passX.setInputCloud(mapCloud);
+			passX.setFilterFieldName("x");
+			passX.setFilterLimits(initialGuess(0, 3) - 45.0f, initialGuess(0, 3) + 45.0f);
+			passX.filter(*localMapX);
 
-			// Accept NDT output only when both convergence and fitness checks pass.
+			pcl::PassThrough<PointT> passY;
+			passY.setInputCloud(localMapX);
+			passY.setFilterFieldName("y");
+			passY.setFilterLimits(initialGuess(1, 3) - 45.0f, initialGuess(1, 3) + 45.0f);
+			passY.filter(*localMapCloud);
+
+			if(localMapCloud->size() < 2000){
+				*localMapCloud = *mapCloud;
+			}
+
+			// Run ICP from the predicted pose and keep only numerically stable results.
+			icp.setInputTarget(localMapCloud);
+			icp.setInputSource(currentScan);
+			icp.align(*alignedCloud, initialGuess);
+			const bool icpConverged = icp.hasConverged();
+			const double icpFitness = icp.getFitnessScore();
+			const bool icpValid = icpConverged && std::isfinite(icpFitness) && icpFitness < 2.5;
+
 			Eigen::Matrix4f matchTransform = initialGuess;
-			if (ndtValid) {
-				matchTransform = ndt.getFinalTransformation();
+			if (icpValid) {
+				matchTransform = icp.getFinalTransformation();
 			}
 
 			pose.position.x = matchTransform(0, 3);
@@ -292,21 +304,8 @@ int main(){
 			pose.position.z = matchTransform(2, 3);
 			pose.rotation.yaw = atan2(matchTransform(1, 0), matchTransform(0, 0));
 
-			// Step 3: Transform the filtered scan and render it around the current ego location.
-			Eigen::Matrix4f renderTransform = matchTransform;
-			if (!ndtValid) {
-				renderTransform = Eigen::Matrix4f::Identity();
-				const float rcy = static_cast<float>(cos(truePose.rotation.yaw));
-				const float rsy = static_cast<float>(sin(truePose.rotation.yaw));
-				renderTransform(0, 0) = rcy;
-				renderTransform(0, 1) = -rsy;
-				renderTransform(1, 0) = rsy;
-				renderTransform(1, 1) = rcy;
-				renderTransform(0, 3) = static_cast<float>(truePose.position.x);
-				renderTransform(1, 3) = static_cast<float>(truePose.position.y);
-				renderTransform(2, 3) = static_cast<float>(truePose.position.z);
-			}
-			pcl::transformPointCloud(*currentScan, *transformedScan, renderTransform);
+			// Step 3: Render scan points in map frame using the accepted transform.
+			pcl::transformPointCloud(*currentScan, *transformedScan, matchTransform);
 			viewer->removePointCloud("scan");
 			renderPointCloud(viewer, transformedScan, "scan", Color(1,0,0) );
 

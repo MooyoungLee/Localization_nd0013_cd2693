@@ -157,10 +157,10 @@ int main(){
 	typename pcl::PointCloud<PointT>::Ptr localMapCloud (new pcl::PointCloud<PointT>);
 	// Keep ICP object alive across frames to avoid repeated setup cost.
 	pcl::IterativeClosestPoint<PointT, PointT> icp;
-	icp.setMaximumIterations(12);
-	icp.setMaxCorrespondenceDistance(2.5);
-	icp.setTransformationEpsilon(1e-4);
-	icp.setEuclideanFitnessEpsilon(1e-3);
+	icp.setMaximumIterations(6);
+	icp.setMaxCorrespondenceDistance(1.5);
+	icp.setTransformationEpsilon(5e-4);
+	icp.setEuclideanFitnessEpsilon(2e-3);
 
 	lidar->Listen([&new_scan, &scan_mutex, &lastScanTime, &scanCloud](auto data){
 
@@ -178,7 +178,7 @@ int main(){
 					}
 				}
 			}
-			if(pclCloud.points.size() > 3000){ // Batch size for each scan-matching update.
+			if(pclCloud.points.size() > 2000){ // Batch size for each scan-matching update.
 				lastScanTime = std::chrono::system_clock::now();
 				*scanCloud = pclCloud;
 				new_scan = false;
@@ -252,7 +252,7 @@ int main(){
 			// Downsample the raw scan to keep registration fast and reduce noise.
 			pcl::VoxelGrid<PointT> voxelFilter;
 			voxelFilter.setInputCloud(currentScan);
-			voxelFilter.setLeafSize(0.35f, 0.35f, 0.35f);
+			voxelFilter.setLeafSize(0.5f, 0.5f, 0.5f);
 			voxelFilter.filter(*cloudFiltered);
 			currentScan.swap(cloudFiltered);
 
@@ -273,13 +273,13 @@ int main(){
 			pcl::PassThrough<PointT> passX;
 			passX.setInputCloud(mapCloud);
 			passX.setFilterFieldName("x");
-			passX.setFilterLimits(initialGuess(0, 3) - 45.0f, initialGuess(0, 3) + 45.0f);
+			passX.setFilterLimits(initialGuess(0, 3) - 30.0f, initialGuess(0, 3) + 30.0f);
 			passX.filter(*localMapX);
 
 			pcl::PassThrough<PointT> passY;
 			passY.setInputCloud(localMapX);
 			passY.setFilterFieldName("y");
-			passY.setFilterLimits(initialGuess(1, 3) - 45.0f, initialGuess(1, 3) + 45.0f);
+			passY.setFilterLimits(initialGuess(1, 3) - 30.0f, initialGuess(1, 3) + 30.0f);
 			passY.filter(*localMapCloud);
 
 			if(localMapCloud->size() < 2000){

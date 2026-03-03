@@ -8,6 +8,7 @@
 #include <carla/client/Sensor.h>
 #include <carla/sensor/data/LidarMeasurement.h>
 #include <thread>
+#include <mutex>
 
 #include <carla/client/Vehicle.h>
 
@@ -27,6 +28,7 @@ using namespace std;
 #include <pcl/io/pcd_io.h>
 #include <pcl/visualization/pcl_visualizer.h>
 #include <pcl/filters/voxel_grid.h>
+#include <pcl/filters/filter.h>
 #include "helper.h"
 #include <sstream>
 #include <chrono> 
@@ -127,6 +129,7 @@ int main(){
 	auto lidar_actor = world.SpawnActor(lidar_bp, lidar_transform, ego_actor.get());
 	auto lidar = boost::static_pointer_cast<cc::Sensor>(lidar_actor);
 	bool new_scan = true;
+	std::mutex scan_mutex;
 	std::chrono::time_point<std::chrono::system_clock> lastScanTime, startTime;
 
 	pcl::visualization::PCLVisualizer::Ptr viewer (new pcl::visualization::PCLVisualizer ("3D Viewer"));
@@ -139,6 +142,8 @@ int main(){
 	// Load map
 	PointCloudT::Ptr mapCloud(new PointCloudT);
   	pcl::io::loadPCDFile("map.pcd", *mapCloud);
+	std::vector<int> mapIndices;
+	pcl::removeNaNFromPointCloud(*mapCloud, *mapCloud, mapIndices);
   	cout << "Loaded " << mapCloud->points.size() << " data points from map.pcd" << endl;
 	renderPointCloud(viewer, mapCloud, "map", Color(0,0,1)); 
 
@@ -158,8 +163,9 @@ int main(){
 	// Hard cap for runtime per scan match.
 	ndt.setMaximumIterations(20);
 
-	lidar->Listen([&new_scan, &lastScanTime, &scanCloud](auto data){
+	lidar->Listen([&new_scan, &scan_mutex, &lastScanTime, &scanCloud](auto data){
 
+		std::lock_guard<std::mutex> lock(scan_mutex);
 		if(new_scan){
 			auto scan = boost::static_pointer_cast<csd::LidarMeasurement>(data);
 			for (auto detection : *scan){
@@ -180,7 +186,15 @@ int main(){
 
 	while (!viewer->wasStopped())
   	{
-		while(new_scan){
+		while(true){
+			bool waiting_scan = true;
+			{
+				std::lock_guard<std::mutex> lock(scan_mutex);
+				waiting_scan = new_scan;
+			}
+			if(!waiting_scan){
+				break;
+			}
 			std::this_thread::sleep_for(0.1s);
 			world.Tick(1s);
 		}
@@ -210,15 +224,32 @@ int main(){
 
   		viewer->spinOnce ();
 		
-		if(!new_scan){
-			
-			new_scan = true;
+		bool has_scan = false;
+		{
+			std::lock_guard<std::mutex> lock(scan_mutex);
+			has_scan = !new_scan;
+		}
+		if(has_scan){
+			PointCloudT::Ptr currentScan(new PointCloudT);
+			{
+				std::lock_guard<std::mutex> lock(scan_mutex);
+				*currentScan = *scanCloud;
+				new_scan = true;
+				pclCloud.points.clear();
+			}
+
+			std::vector<int> scanIndices;
+			pcl::removeNaNFromPointCloud(*currentScan, *currentScan, scanIndices);
+			if(currentScan->empty()){
+				continue;
+			}
+
 			// TODO: Voxel downsample the incoming scan before scan matching for speed and robustness.
 			pcl::VoxelGrid<PointT> voxelFilter;
-			voxelFilter.setInputCloud(scanCloud);
+			voxelFilter.setInputCloud(currentScan);
 			voxelFilter.setLeafSize(0.2f, 0.2f, 0.2f);
 			voxelFilter.filter(*cloudFiltered);
-			scanCloud.swap(cloudFiltered);
+			currentScan.swap(cloudFiltered);
 
 			// Build an initial transform guess from the previous pose estimate.
 			// A good seed reduces NDT iterations and prevents local minima.
@@ -235,7 +266,7 @@ int main(){
 
 			// Align current lidar scan (source) to map (target) using NDT.
 			// alignedCloud receives the transformed source points.
-			ndt.setInputSource(scanCloud);
+			ndt.setInputSource(currentScan);
 			ndt.align(*alignedCloud, initialGuess);
 			const bool ndtConverged = ndt.hasConverged();
 			if (ndtConverged) {
@@ -251,7 +282,7 @@ int main(){
 			viewer->removePointCloud("scan");
 			
 			// TODO: Change `scanCloud` below to your transformed scan
-			renderPointCloud(viewer, ndtConverged ? alignedCloud : scanCloud, "scan", Color(1,0,0) );
+			renderPointCloud(viewer, ndtConverged ? alignedCloud : currentScan, "scan", Color(1,0,0) );
 
 			viewer->removeAllShapes();
 			drawCar(pose, 1,  Color(0,1,0), 0.35, viewer);
@@ -276,8 +307,6 @@ int main(){
 				viewer->addText("Passed!", 200, 50, 32, 0.0, 1.0, 0.0, "eval",0);
 			}
 		}
-
-			pclCloud.points.clear();
 		}
   	}
 	return 0;

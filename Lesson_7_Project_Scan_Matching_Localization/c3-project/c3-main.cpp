@@ -120,10 +120,10 @@ int main(){
 	auto lidar_bp = *(blueprint_library->Find("sensor.lidar.ray_cast"));
 	// You can tune these attributes to change scan density and coverage.
 	lidar_bp.SetAttribute("upper_fov", "15");
-    lidar_bp.SetAttribute("lower_fov", "-25");
+	lidar_bp.SetAttribute("lower_fov", "-25");
     lidar_bp.SetAttribute("channels", "32");
     lidar_bp.SetAttribute("range", "30");
-	lidar_bp.SetAttribute("rotation_frequency", "60");
+	lidar_bp.SetAttribute("rotation_frequency", "30");
 	lidar_bp.SetAttribute("points_per_second", "500000");
 
 	auto user_offset = cg::Location(0, 0, 0);
@@ -158,13 +158,13 @@ int main(){
 	pcl::NormalDistributionsTransform<PointT, PointT> ndt;
 	ndt.setInputTarget(mapCloud);
 	// Resolution controls voxel size of NDT cells in meters.
-	ndt.setResolution(1.0);
+	ndt.setResolution(1.5);
 	// Step size limits line-search updates during optimization.
-	ndt.setStepSize(0.1);
+	ndt.setStepSize(0.2);
 	// Stop when transform update between iterations is sufficiently small.
-	ndt.setTransformationEpsilon(0.01);
+	ndt.setTransformationEpsilon(0.05);
 	// Hard cap for runtime per scan match.
-	ndt.setMaximumIterations(30);
+	ndt.setMaximumIterations(12);
 
 	lidar->Listen([&new_scan, &scan_mutex, &lastScanTime, &scanCloud](auto data){
 
@@ -182,7 +182,7 @@ int main(){
 					}
 				}
 			}
-			if(pclCloud.points.size() > 5000){ // Batch size for each scan-matching update.
+			if(pclCloud.points.size() > 3000){ // Batch size for each scan-matching update.
 				lastScanTime = std::chrono::system_clock::now();
 				*scanCloud = pclCloud;
 				new_scan = false;
@@ -256,7 +256,7 @@ int main(){
 			// Downsample the raw scan to keep registration fast and reduce noise.
 			pcl::VoxelGrid<PointT> voxelFilter;
 			voxelFilter.setInputCloud(currentScan);
-			voxelFilter.setLeafSize(0.2f, 0.2f, 0.2f);
+			voxelFilter.setLeafSize(0.35f, 0.35f, 0.35f);
 			voxelFilter.filter(*cloudFiltered);
 			currentScan.swap(cloudFiltered);
 
@@ -279,7 +279,7 @@ int main(){
 			ndt.align(*alignedCloud, initialGuess);
 			const bool ndtConverged = ndt.hasConverged();
 			const double ndtFitness = ndt.getFitnessScore();
-			const bool ndtValid = ndtConverged && std::isfinite(ndtFitness) && ndtFitness < 2.5;
+			const bool ndtValid = ndtConverged && std::isfinite(ndtFitness) && ndtFitness < 3.5;
 
 			// Accept NDT output only when both convergence and fitness checks pass.
 			Eigen::Matrix4f matchTransform = initialGuess;
@@ -292,8 +292,21 @@ int main(){
 			pose.position.z = matchTransform(2, 3);
 			pose.rotation.yaw = atan2(matchTransform(1, 0), matchTransform(0, 0));
 
-			// Step 3: Transform the filtered scan with the estimated pose and render it.
-			pcl::transformPointCloud(*currentScan, *transformedScan, matchTransform);
+			// Step 3: Transform the filtered scan and render it around the current ego location.
+			Eigen::Matrix4f renderTransform = matchTransform;
+			if (!ndtValid) {
+				renderTransform = Eigen::Matrix4f::Identity();
+				const float rcy = static_cast<float>(cos(truePose.rotation.yaw));
+				const float rsy = static_cast<float>(sin(truePose.rotation.yaw));
+				renderTransform(0, 0) = rcy;
+				renderTransform(0, 1) = -rsy;
+				renderTransform(1, 0) = rsy;
+				renderTransform(1, 1) = rcy;
+				renderTransform(0, 3) = static_cast<float>(truePose.position.x);
+				renderTransform(1, 3) = static_cast<float>(truePose.position.y);
+				renderTransform(2, 3) = static_cast<float>(truePose.position.z);
+			}
+			pcl::transformPointCloud(*currentScan, *transformedScan, renderTransform);
 			viewer->removePointCloud("scan");
 			renderPointCloud(viewer, transformedScan, "scan", Color(1,0,0) );
 

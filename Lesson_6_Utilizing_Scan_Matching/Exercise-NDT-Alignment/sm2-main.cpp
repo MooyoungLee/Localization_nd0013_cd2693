@@ -22,57 +22,53 @@ Pose pose(Point(0,0,0), Rotate(0,0,0));
 Pose savedPose = pose;
 void keyboardEventOccurred(const pcl::visualization::KeyboardEvent &event, void* viewer)
 {
+
+  	//boost::shared_ptr<pcl::visualization::PCLVisualizer> viewer = *static_cast<boost::shared_ptr<pcl::visualization::PCLVisualizer> *>(viewer_void);
 	if (event.getKeySym() == "Right" && event.keyDown()){
-		matching = Off;
-		pose.position.x += 0.1;
+		cs.push_back(ControlState(0, -0.02, 0));
   	}
 	else if (event.getKeySym() == "Left" && event.keyDown()){
-		matching = Off;
-		pose.position.x -= 0.1;
+		cs.push_back(ControlState(0, 0.02, 0)); 
   	}
-  	else if (event.getKeySym() == "Up" && event.keyDown()){
-		matching = Off;
-		pose.position.y += 0.1;
+  	if (event.getKeySym() == "Up" && event.keyDown()){
+		cs.push_back(ControlState(0.1, 0, 0));
   	}
 	else if (event.getKeySym() == "Down" && event.keyDown()){
-		matching = Off;
-		pose.position.y -= 0.1;
+		cs.push_back(ControlState(-0.1, 0, 0)); 
   	}
-	else if (event.getKeySym() == "k" && event.keyDown()){
-		matching = Off;
-		pose.rotation.yaw += 0.1;
-		while( pose.rotation.yaw > 2*pi)
-			pose.rotation.yaw -= 2*pi; 
-  	}
-	else if (event.getKeySym() == "l" && event.keyDown()){
-		matching = Off;
-		pose.rotation.yaw -= 0.1;
-		while( pose.rotation.yaw < 0)
-			pose.rotation.yaw += 2*pi; 
-  	}
-	else if(event.getKeySym() == "n" && event.keyDown()){
-		matching = Ndt;
-	}
-	else if(event.getKeySym() == "space" && event.keyDown()){
-		matching = Off;
-		pose = savedPose;
-	}
-	else if(event.getKeySym() == "x" && event.keyDown()){
-		matching = Off;
-		savedPose = pose;
-	}
 
+	if(event.getKeySym() == "a" && event.keyDown()){
+		refresh_view = true;
+	}
+	if(event.getKeySym() == "s" && event.keyDown()){
+		save_map = true;
+	}
 }
 
-Eigen::Matrix4d NDT(pcl::NormalDistributionsTransform<pcl::PointXYZ, pcl::PointXYZ> ndt, PointCloudT::Ptr source, Pose startingPose, int iterations){
+void Accuate(ControlState response, cc::Vehicle::Control& state){
 
-  	Eigen::Matrix4d transformation_matrix = Eigen::Matrix4d::Identity ();
+	if(response.t > 0){
+		if(!state.reverse){
+			state.throttle = min(state.throttle+response.t, 1.0f);
+		}
+		else{
+			state.reverse = false;
+			state.throttle = min(response.t, 1.0f);
+		}
+	}
+	else if(response.t < 0){
+		response.t = -response.t;
+		if(state.reverse){
+			state.throttle = min(state.throttle+response.t, 1.0f);
+		}
+		else{
+			state.reverse = true;
+			state.throttle = min(response.t, 1.0f);
 
-  	// TODO: Implement the PCL NDT function and return the correct transformation matrix
-  	// .....
-  	
-  	return transformation_matrix;
-
+		}
+	}
+	state.steer = min( max(state.steer+response.s, -1.0f), 1.0f);
+	state.brake = response.b;
 }
 
 void drawCar(Pose pose, int num, Color color, double alpha, pcl::visualization::PCLVisualizer::Ptr& viewer){
@@ -86,123 +82,128 @@ void drawCar(Pose pose, int num, Color color, double alpha, pcl::visualization::
 	renderBox(viewer, box, num, color, alpha);
 }
 
-struct Tester{
-
-	Pose pose;
-	bool init = true;
-	int cycles = 0;
-	pcl::console::TicToc timer;
-
-	//thresholds
-	double distThresh = 1e-3;
-	double angleThresh = 1e-3;
-
-	vector<double> distHistory;
-	vector<double> angleHistory;
-
-	void Reset(){
-		cout << "Total time: " << timer.toc () << " ms, Total cycles: " << cycles << endl;
-		init = true;
-		cycles = 0;
-		distHistory.clear();
-		angleHistory.clear();
-	}
-
-	double angleMag( double angle){
-
-		return abs(fmod(angle+pi, 2*pi) - pi);
-	}
-
-	bool Displacement( Pose p){
-
-		if(init){
-			timer.tic();
-			pose = p;
-			init = false;
-			return true;
-		}
-
-		Pose movement = p - pose;
-		double tdist = sqrt(movement.position.x * movement.position.x + movement.position.y * movement.position.y + movement.position.z * movement.position.z);
-		double adist = max( max( angleMag(movement.rotation.yaw), angleMag(movement.rotation.pitch)), angleMag(movement.rotation.roll) );
-
-		if(tdist > distThresh || adist > angleThresh){
-			distHistory.push_back(tdist);
-			angleHistory.push_back(adist);
-			pose = p;
-
-			cycles++;
-			return true;
-		}
-		else
-			return false;
-	
-	}
-
-};
-
 int main(){
+
+	
+	auto client = cc::Client("localhost", 2000);
+	client.SetTimeout(2s);
+	auto world = client.GetWorld();
+
+	auto blueprint_library = world.GetBlueprintLibrary();
+	auto vehicles = blueprint_library->Filter("vehicle");
+
+	auto map = world.GetMap();
+	auto transform = map->GetRecommendedSpawnPoints()[1];
+	auto ego_actor = world.SpawnActor((*vehicles)[12], transform);
+
+	//Create lidar
+	auto lidar_bp = *(blueprint_library->Find("sensor.lidar.ray_cast"));
+	// CANDO: Can modify lidar values to get different scan resolutions
+	lidar_bp.SetAttribute("upper_fov", "15");
+    lidar_bp.SetAttribute("lower_fov", "-25");
+    lidar_bp.SetAttribute("channels", "32");
+    lidar_bp.SetAttribute("range", "30");
+	lidar_bp.SetAttribute("rotation_frequency", "30");
+	lidar_bp.SetAttribute("points_per_second", "500000");
+
+	auto user_offset = cg::Location(0, 0, 0);
+	auto lidar_transform = cg::Transform(cg::Location(-0.5, 0, 1.8) + user_offset);
+	auto lidar_actor = world.SpawnActor(lidar_bp, lidar_transform, ego_actor.get());
+	auto lidar = boost::static_pointer_cast<cc::Sensor>(lidar_actor);
+	bool new_scan = true;
+	std::chrono::time_point<std::chrono::system_clock> lastScanTime;
 
 	pcl::visualization::PCLVisualizer::Ptr viewer (new pcl::visualization::PCLVisualizer ("3D Viewer"));
   	viewer->setBackgroundColor (0, 0, 0);
 	viewer->registerKeyboardCallback(keyboardEventOccurred, (void*)&viewer);
-	viewer->setCameraPosition(pose.position.x, pose.position.y, 60, pose.position.x+1, pose.position.y+1, 0, 0, 0, 1);
 
-	// Load map and display it
-	PointCloudT::Ptr mapCloud(new PointCloudT);
-  	pcl::io::loadPCDFile("map.pcd", *mapCloud);
-  	cout << "Loaded " << mapCloud->points.size() << " data points from map.pcd" << endl;
-	renderPointCloud(viewer, mapCloud, "map", Color(0,0,1)); 
+	auto vehicle = boost::static_pointer_cast<cc::Vehicle>(ego_actor);
+	Pose pose(Point(0,0,0), Rotate(0,0,0));
+	Pose poseRef(Point(vehicle->GetTransform().location.x, vehicle->GetTransform().location.y, vehicle->GetTransform().location.z), Rotate(vehicle->GetTransform().rotation.yaw * pi/180, vehicle->GetTransform().rotation.pitch * pi/180, vehicle->GetTransform().rotation.roll * pi/180));
 
-	// True pose for the input scan
-	vector<Pose> truePose ={Pose(Point(2.62296,0.0384164,0), Rotate(6.10189e-06,0,0)), Pose(Point(4.91308,0.0732088,0), Rotate(3.16001e-05,0,0))};
-	drawCar(truePose[0], 0,  Color(1,0,0), 0.7, viewer);
+	lidar->Listen([&new_scan, &lastScanTime, &pose, &viewer](auto data){
 
-	// Load input scan
-	PointCloudT::Ptr scanCloud(new PointCloudT);
-  	pcl::io::loadPCDFile("scan1.pcd", *scanCloud);
-
-	typename pcl::PointCloud<PointT>::Ptr cloudFiltered (new pcl::PointCloud<PointT>);
-
-	cloudFiltered = scanCloud; // TODO: remove this line
-	//TODO: Create voxel filter for input scan and save to cloudFiltered
-	// ......
-
-	pcl::NormalDistributionsTransform<pcl::PointXYZ, pcl::PointXYZ> ndt;
-	//TODO: Set resolution and point cloud target (map) for ndt
-	// ......
-
-	PointCloudT::Ptr transformed_scan (new PointCloudT);
-	Tester tester;
-
-	while (!viewer->wasStopped())
-  	{
-		Eigen::Matrix4d transform = transform3D(pose.rotation.yaw, pose.rotation.pitch, pose.rotation.roll, pose.position.x, pose.position.y, pose.position.z);
-
-		if( matching != Off){
-			if( matching == Ndt)
-				transform = NDT(ndt, cloudFiltered, pose, 0); //TODO: change the number of iterations to positive number
-  			pose = getPose(transform);
-			if( !tester.Displacement(pose) ){
-				if(matching == Ndt)
-					cout << " Done testing NDT" << endl;
-				tester.Reset();
-				double pose_error = sqrt( (truePose[0].position.x - pose.position.x) * (truePose[0].position.x - pose.position.x) + (truePose[0].position.y - pose.position.y) * (truePose[0].position.y - pose.position.y) );
-				cout << "pose error: " << pose_error << endl;
-				matching = Off;
+		if(new_scan){
+			auto scan = boost::static_pointer_cast<csd::LidarMeasurement>(data);
+	
+			Eigen::Matrix4d transform = transform3D(pose.rotation.yaw, pose.rotation.pitch, pose.rotation.roll, pose.position.x, pose.position.y, pose.position.z);
+			for (auto detection : *scan){
+				if((detection.x*detection.x + detection.y*detection.y + detection.z*detection.z) > 8.0){ // Don't include points touching ego
+					Eigen::Vector4d local_point(detection.x, detection.y, detection.z, 1);
+					Eigen::Vector4d transform_point = transform * local_point;
+					pclCloud.points.push_back(PointT(transform_point[0], transform_point[1], transform_point[2]));
+				}
+	
 			}
+			if(pclCloud.points.size() > 5000) // CANDO: Can modify this value to get different scan resolutions
+				new_scan = false;
+
+			lastScanTime = std::chrono::system_clock::now();
+
+			PointCloudT::Ptr scanCloud(new PointCloudT);
+			*scanCloud = pclCloud;
+			viewer->removeAllPointClouds();
+			renderPointCloud(viewer, scanCloud, "map", Color(0,0,1)); 
+			
+		}
+
+	});
+
+	vector<Point> scanPoses = {Point(poseRef.position.x, poseRef.position.y, poseRef.position.z)};
+
+	while (!viewer->wasStopped () && !save_map)
+  	{
+		while(new_scan){
+			std::this_thread::sleep_for(0.1s);
+			world.Tick(1s);
 		}
 		
-  		pcl::transformPointCloud (*cloudFiltered, *transformed_scan, transform);
-		viewer->removePointCloud("scan");
-		renderPointCloud(viewer, transformed_scan, "scan", Color(1,0,0)	);
+		if(refresh_view){
+			viewer->setCameraPosition(pose.position.x, pose.position.y, 60, pose.position.x+1, pose.position.y+1, 0, 0, 0, 1);
+			refresh_view = false;
+		}
 
-		viewer->removeShape("box1");
-		viewer->removeShape("boxFill1");
-		drawCar(pose, 1,  Color(0,1,0), 0.35, viewer);
+		viewer->removeAllShapes();
+		pose = Pose(Point(vehicle->GetTransform().location.x, vehicle->GetTransform().location.y, vehicle->GetTransform().location.z), Rotate(vehicle->GetTransform().rotation.yaw * pi/180, vehicle->GetTransform().rotation.pitch * pi/180, vehicle->GetTransform().rotation.roll * pi/180)) - poseRef;
+
+		drawCar(pose, 0,  Color(1,0,0), 0.7, viewer);
+		double theta = pose.rotation.yaw;
+		double stheta = control.steer * pi/4 + theta;
+		viewer->removeShape("steer");
+		renderRay(viewer, Point(pose.position.x+2*cos(theta), pose.position.y+2*sin(theta),pose.position.z),  Point(pose.position.x+4*cos(stheta), pose.position.y+4*sin(stheta),pose.position.z), "steer", Color(0,1,0));
 		
-  		viewer->spinOnce ();
+		ControlState accuate(0, 0, 1);
+		if(cs.size() > 0){
+			accuate = cs.back();
+			cs.clear();
+
+			Accuate(accuate, control);
+			vehicle->ApplyControl(control);
+		}
+
+		viewer->spinOnce ();
+		
+		currentTime = std::chrono::system_clock::now();
+		if(!new_scan){
+			std::chrono::duration<double> last_scan_seconds = currentTime - lastScanTime; 
+			if(last_scan_seconds.count() > 1.0 && minDistance(Point(pose.position.x, pose.position.y, pose.position.z), scanPoses) > 5.0){
+				scanPoses.push_back(Point(pose.position.x, pose.position.y, pose.position.z));
+				new_scan = true;
+
+			}
+		}
   	}
+
+	// save the point cloud map
+	PointCloudT::Ptr scanCloud(new PointCloudT);
+	*scanCloud = pclCloud;
+	scanCloud->width = scanCloud->points.size();
+	scanCloud->height = 1;
+
+	// TODO: Downsample the map point cloud using a voxel filter
+
+	pcl::io::savePCDFileASCII ("my_map.pcd", *scanCloud);
+	cout << "saved pcd map" << endl;
 
 	return 0;
 }

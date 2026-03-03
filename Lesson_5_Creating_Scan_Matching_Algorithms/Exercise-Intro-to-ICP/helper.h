@@ -1,6 +1,7 @@
 #include <pcl/io/pcd_io.h>
 #include <pcl/visualization/pcl_visualizer.h>
 #include <math.h>
+#include <algorithm>
 #include <vector>
 
 typedef pcl::PointXYZ PointT;
@@ -73,7 +74,7 @@ struct LineSegment{
 
 	LineSegment(float setMy, double setMx, double setB, double setMin, double setMax)
                 : my(setMy), mx(setMx), b(setB), min(setMin), max(setMax){
-                if (setMy == 0 and setMx == 0){
+                if (setMy == 0 && setMx == 0){
                 	my = 0;
                 	mx = 1;
                 }
@@ -147,8 +148,8 @@ struct Lidar{
 				//cout << "vertical" << endl;
 
 				double yb = sin(angle) * range;
-				double minb = min(y,yb);
-				double maxb = max(y,yb);
+				double minb = std::min(y, yb);
+				double maxb = std::max(y, yb);
 
 				ray = LineSegment(1, 0, x, minb, maxb);
 
@@ -159,8 +160,8 @@ struct Lidar{
 				double b = y - x*m;
 
 				double xb = cos(angle) * range;
-				double minb = min(x,xb);
-				double maxb = max(x,xb);
+				double minb = std::min(x, xb);
+				double maxb = std::max(x, xb);
 
 				ray = LineSegment(m, 1, b, minb, maxb);
 			}

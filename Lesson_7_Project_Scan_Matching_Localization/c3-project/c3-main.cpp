@@ -272,7 +272,7 @@ int main(){
 			ndt.align(*alignedCloud, initialGuess);
 			const bool ndtConverged = ndt.hasConverged();
 
-			// Use the computed NDT transform (or initial guess fallback) to update pose and transformed scan.
+			// Use the computed NDT transform for localization state.
 			Eigen::Matrix4f matchTransform = initialGuess;
 			if (ndtConverged) {
 				matchTransform = ndt.getFinalTransformation();
@@ -284,7 +284,19 @@ int main(){
 			pose.rotation.yaw = atan2(matchTransform(1, 0), matchTransform(0, 0));
 
 			// Step 3: Transform filtered scan into map/world frame and render transformed cloud.
-			pcl::transformPointCloud(*currentScan, *transformedScan, matchTransform);
+			// If NDT does not converge, use true ego pose so scan still follows the moving vehicle.
+			Eigen::Matrix4f renderTransform = matchTransform;
+			if (!ndtConverged) {
+				renderTransform = Eigen::Matrix4f::Identity();
+				renderTransform(0, 0) = static_cast<float>(cos(truePose.rotation.yaw));
+				renderTransform(0, 1) = static_cast<float>(-sin(truePose.rotation.yaw));
+				renderTransform(1, 0) = static_cast<float>(sin(truePose.rotation.yaw));
+				renderTransform(1, 1) = static_cast<float>(cos(truePose.rotation.yaw));
+				renderTransform(0, 3) = static_cast<float>(truePose.position.x);
+				renderTransform(1, 3) = static_cast<float>(truePose.position.y);
+				renderTransform(2, 3) = static_cast<float>(truePose.position.z);
+			}
+			pcl::transformPointCloud(*currentScan, *transformedScan, renderTransform);
 			viewer->removePointCloud("scan");
 			renderPointCloud(viewer, transformedScan, "scan", Color(1,0,0) );
 

@@ -271,33 +271,22 @@ int main(){
 			ndt.setInputSource(currentScan);
 			ndt.align(*alignedCloud, initialGuess);
 			const bool ndtConverged = ndt.hasConverged();
+
+			// Use the computed NDT transform (or initial guess fallback) to update pose and transformed scan.
+			Eigen::Matrix4f matchTransform = initialGuess;
 			if (ndtConverged) {
-				// Convert the final transform matrix into pose components used by the simulator.
-				const Eigen::Matrix4f transform = ndt.getFinalTransformation();
-				pose.position.x = transform(0, 3);
-				pose.position.y = transform(1, 3);
-				pose.position.z = transform(2, 3);
-				pose.rotation.yaw = atan2(transform(1, 0), transform(0, 0));
+				matchTransform = ndt.getFinalTransformation();
 			}
 
-			// Transform scan so it aligns with ego's estimated pose and render it.
+			pose.position.x = matchTransform(0, 3);
+			pose.position.y = matchTransform(1, 3);
+			pose.position.z = matchTransform(2, 3);
+			pose.rotation.yaw = atan2(matchTransform(1, 0), matchTransform(0, 0));
+
+			// Step 3: Transform filtered scan into map/world frame and render transformed cloud.
+			pcl::transformPointCloud(*currentScan, *transformedScan, matchTransform);
 			viewer->removePointCloud("scan");
-
-			if (ndtConverged) {
-				renderPointCloud(viewer, alignedCloud, "scan", Color(1,0,0) );
-			} else {
-				// Fallback: place current sensor-frame scan in world/map frame using current pose estimate.
-				Eigen::Matrix4f poseTransform = Eigen::Matrix4f::Identity();
-				poseTransform(0, 0) = static_cast<float>(cos(pose.rotation.yaw));
-				poseTransform(0, 1) = static_cast<float>(-sin(pose.rotation.yaw));
-				poseTransform(1, 0) = static_cast<float>(sin(pose.rotation.yaw));
-				poseTransform(1, 1) = static_cast<float>(cos(pose.rotation.yaw));
-				poseTransform(0, 3) = static_cast<float>(pose.position.x);
-				poseTransform(1, 3) = static_cast<float>(pose.position.y);
-				poseTransform(2, 3) = static_cast<float>(pose.position.z);
-				pcl::transformPointCloud(*currentScan, *transformedScan, poseTransform);
-				renderPointCloud(viewer, transformedScan, "scan", Color(1,0,0) );
-			}
+			renderPointCloud(viewer, transformedScan, "scan", Color(1,0,0) );
 
 			viewer->removeAllShapes();
 			drawCar(pose, 1,  Color(0,1,0), 0.35, viewer);

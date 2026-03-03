@@ -144,6 +144,19 @@ int main(){
 
 	typename pcl::PointCloud<PointT>::Ptr cloudFiltered (new pcl::PointCloud<PointT>);
 	typename pcl::PointCloud<PointT>::Ptr scanCloud (new pcl::PointCloud<PointT>);
+	typename pcl::PointCloud<PointT>::Ptr alignedCloud (new pcl::PointCloud<PointT>);
+	// NDT is configured once and reused each frame to avoid repeated allocator/setup overhead.
+	// The target is the static map point cloud; each incoming scan becomes the source.
+	pcl::NormalDistributionsTransform<PointT, PointT> ndt;
+	ndt.setInputTarget(mapCloud);
+	// Resolution controls voxel size of NDT cells in meters.
+	ndt.setResolution(1.0);
+	// Step size limits line-search updates during optimization.
+	ndt.setStepSize(0.1);
+	// Stop when transform update between iterations is sufficiently small.
+	ndt.setTransformationEpsilon(0.01);
+	// Hard cap for runtime per scan match.
+	ndt.setMaximumIterations(20);
 
 	lidar->Listen([&new_scan, &lastScanTime, &scanCloud](auto data){
 
@@ -200,16 +213,45 @@ int main(){
 		if(!new_scan){
 			
 			new_scan = true;
-			// TODO: (Filter scan using voxel filter)
+			// TODO: Voxel downsample the incoming scan before scan matching for speed and robustness.
+			pcl::VoxelGrid<PointT> voxelFilter;
+			voxelFilter.setInputCloud(scanCloud);
+			voxelFilter.setLeafSize(0.2f, 0.2f, 0.2f);
+			voxelFilter.filter(*cloudFiltered);
+			scanCloud.swap(cloudFiltered);
 
-			// TODO: Find pose transform by using ICP or NDT matching
-			//pose = ....
+			// Build an initial transform guess from the previous pose estimate.
+			// A good seed reduces NDT iterations and prevents local minima.
+			Eigen::Matrix4f initialGuess = Eigen::Matrix4f::Identity();
+			const float cy = static_cast<float>(cos(pose.rotation.yaw));
+			const float sy = static_cast<float>(sin(pose.rotation.yaw));
+			initialGuess(0, 0) = cy;
+			initialGuess(0, 1) = -sy;
+			initialGuess(1, 0) = sy;
+			initialGuess(1, 1) = cy;
+			initialGuess(0, 3) = static_cast<float>(pose.position.x);
+			initialGuess(1, 3) = static_cast<float>(pose.position.y);
+			initialGuess(2, 3) = static_cast<float>(pose.position.z);
+
+			// Align current lidar scan (source) to map (target) using NDT.
+			// alignedCloud receives the transformed source points.
+			ndt.setInputSource(scanCloud);
+			ndt.align(*alignedCloud, initialGuess);
+			const bool ndtConverged = ndt.hasConverged();
+			if (ndtConverged) {
+				// Convert the final transform matrix into pose components used by the simulator.
+				const Eigen::Matrix4f transform = ndt.getFinalTransformation();
+				pose.position.x = transform(0, 3);
+				pose.position.y = transform(1, 3);
+				pose.position.z = transform(2, 3);
+				pose.rotation.yaw = atan2(transform(1, 0), transform(0, 0));
+			}
 
 			// TODO: Transform scan so it aligns with ego's actual pose and render that scan
-
 			viewer->removePointCloud("scan");
+			
 			// TODO: Change `scanCloud` below to your transformed scan
-			renderPointCloud(viewer, scanCloud, "scan", Color(1,0,0) );
+			renderPointCloud(viewer, ndtConverged ? alignedCloud : scanCloud, "scan", Color(1,0,0) );
 
 			viewer->removeAllShapes();
 			drawCar(pose, 1,  Color(0,1,0), 0.35, viewer);

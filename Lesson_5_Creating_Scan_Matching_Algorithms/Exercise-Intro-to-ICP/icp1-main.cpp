@@ -16,6 +16,28 @@ Eigen::Matrix4d ICP(PointCloudT::Ptr target, PointCloudT::Ptr source, Pose start
 	Eigen::Matrix4d transformation_matrix = Eigen::Matrix4d::Identity ();
 
 	//TODO: complete the ICP function and return the corrected transform
+	// align source with starting pose
+  	Eigen::Matrix4d initTransform = transform2D(startingPose.theta, startingPose.position.x, startingPose.position.y);
+  	PointCloudT::Ptr transformSource (new PointCloudT); 
+  	pcl::transformPointCloud (*source, *transformSource, initTransform);
+
+	pcl::console::TicToc time;
+  	time.tic ();
+  	pcl::IterativeClosestPoint<PointT, PointT> icp;
+  	icp.setMaximumIterations (iterations);
+  	icp.setInputSource (transformSource);
+  	icp.setInputTarget (target);
+  	PointCloudT::Ptr cloud_icp (new PointCloudT);  // ICP output point cloud
+  	icp.align (*cloud_icp);
+  	
+  	if (icp.hasConverged ())
+  	{
+  		std::cout << "\nICP has converged, score is " << icp.getFitnessScore () << std::endl;
+  		transformation_matrix = icp.getFinalTransformation ().cast<double>();
+  		transformation_matrix =  transformation_matrix * initTransform;
+  		return transformation_matrix;
+  	}
+  	cout << "WARNING: ICP did not converge" << endl;
 
 	return transformation_matrix;
 
@@ -95,12 +117,16 @@ int main(){
 		Eigen::Matrix4d transform = ICP(map, scan, location, 0); //TODO: make the iteration count greater than zero
 		Pose estimate = getPose(transform);
 		// TODO: save estimate location and use it as starting pose for ICP next time
+		location = estimate;
 		
 		locator->points.push_back(PointT(estimate.position.x, estimate.position.y, 0));
 		
 		// view transformed scan
 		// TODO: perform the transformation on the scan using transform from ICP
+  		PointCloudT::Ptr transformed_scan (new PointCloudT);
+  		pcl::transformPointCloud (*scan, *transformed_scan, transform);
 		// TODO: render the correct scan
+  		renderPointCloud(viewer, transformed_scan, "icp_scan_"+to_string(count), Color(0,1,0)); // render corrected scan
 		
 		count++;
 	}

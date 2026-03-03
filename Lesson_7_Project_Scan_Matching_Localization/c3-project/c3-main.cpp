@@ -29,6 +29,7 @@ using namespace std;
 #include <pcl/visualization/pcl_visualizer.h>
 #include <pcl/filters/voxel_grid.h>
 #include <pcl/filters/filter.h>
+#include <pcl/common/transforms.h>
 #include "helper.h"
 #include <sstream>
 #include <chrono> 
@@ -150,6 +151,7 @@ int main(){
 	typename pcl::PointCloud<PointT>::Ptr cloudFiltered (new pcl::PointCloud<PointT>);
 	typename pcl::PointCloud<PointT>::Ptr scanCloud (new pcl::PointCloud<PointT>);
 	typename pcl::PointCloud<PointT>::Ptr alignedCloud (new pcl::PointCloud<PointT>);
+	typename pcl::PointCloud<PointT>::Ptr transformedScan (new pcl::PointCloud<PointT>);
 	// NDT is configured once and reused each frame to avoid repeated allocator/setup overhead.
 	// The target is the static map point cloud; each incoming scan becomes the source.
 	pcl::NormalDistributionsTransform<PointT, PointT> ndt;
@@ -278,11 +280,24 @@ int main(){
 				pose.rotation.yaw = atan2(transform(1, 0), transform(0, 0));
 			}
 
-			// TODO: Transform scan so it aligns with ego's actual pose and render that scan
+			// Transform scan so it aligns with ego's estimated pose and render it.
 			viewer->removePointCloud("scan");
-			
-			// TODO: Change `scanCloud` below to your transformed scan
-			renderPointCloud(viewer, ndtConverged ? alignedCloud : currentScan, "scan", Color(1,0,0) );
+
+			if (ndtConverged) {
+				renderPointCloud(viewer, alignedCloud, "scan", Color(1,0,0) );
+			} else {
+				// Fallback: place current sensor-frame scan in world/map frame using current pose estimate.
+				Eigen::Matrix4f poseTransform = Eigen::Matrix4f::Identity();
+				poseTransform(0, 0) = static_cast<float>(cos(pose.rotation.yaw));
+				poseTransform(0, 1) = static_cast<float>(-sin(pose.rotation.yaw));
+				poseTransform(1, 0) = static_cast<float>(sin(pose.rotation.yaw));
+				poseTransform(1, 1) = static_cast<float>(cos(pose.rotation.yaw));
+				poseTransform(0, 3) = static_cast<float>(pose.position.x);
+				poseTransform(1, 3) = static_cast<float>(pose.position.y);
+				poseTransform(2, 3) = static_cast<float>(pose.position.z);
+				pcl::transformPointCloud(*currentScan, *transformedScan, poseTransform);
+				renderPointCloud(viewer, transformedScan, "scan", Color(1,0,0) );
+			}
 
 			viewer->removeAllShapes();
 			drawCar(pose, 1,  Color(0,1,0), 0.35, viewer);

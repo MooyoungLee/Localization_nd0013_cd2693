@@ -252,7 +252,7 @@ int main(){
 			// Downsample the raw scan to keep registration fast and reduce noise.
 			pcl::VoxelGrid<PointT> voxelFilter;
 			voxelFilter.setInputCloud(currentScan);
-			voxelFilter.setLeafSize(0.45f, 0.45f, 0.45f);
+			voxelFilter.setLeafSize(0.50f, 0.50f, 0.50f);
 			voxelFilter.filter(*cloudFiltered);
 			currentScan.swap(cloudFiltered);
 

@@ -8,10 +8,11 @@
 #include <carla/client/Sensor.h>
 #include <carla/sensor/data/LidarMeasurement.h>
 #include <thread>
+#include <mutex>
 
 #include <carla/client/Vehicle.h>
 
-//pcl code
+// PCL helpers
 //#include "render/render.h"
 
 namespace cc = carla::client;
@@ -27,12 +28,15 @@ using namespace std;
 #include <pcl/io/pcd_io.h>
 #include <pcl/visualization/pcl_visualizer.h>
 #include <pcl/filters/voxel_grid.h>
+#include <pcl/filters/filter.h>
+#include <pcl/filters/passthrough.h>
+#include <pcl/common/transforms.h>
 #include "helper.h"
 #include <sstream>
 #include <chrono> 
 #include <ctime> 
+#include <cmath>
 #include <pcl/registration/icp.h>
-#include <pcl/registration/ndt.h>
 #include <pcl/console/time.h>   // TicToc
 
 PointCloudT pclCloud;
@@ -112,14 +116,14 @@ int main(){
 	auto transform = map->GetRecommendedSpawnPoints()[1];
 	auto ego_actor = world.SpawnActor((*vehicles)[12], transform);
 
-	//Create lidar
+	// Configure lidar sensor.
 	auto lidar_bp = *(blueprint_library->Find("sensor.lidar.ray_cast"));
-	// CANDO: Can modify lidar values to get different scan resolutions
+	// You can tune these attributes to change scan density and coverage.
 	lidar_bp.SetAttribute("upper_fov", "15");
-    lidar_bp.SetAttribute("lower_fov", "-25");
+	lidar_bp.SetAttribute("lower_fov", "-25");
     lidar_bp.SetAttribute("channels", "32");
     lidar_bp.SetAttribute("range", "30");
-	lidar_bp.SetAttribute("rotation_frequency", "60");
+	lidar_bp.SetAttribute("rotation_frequency", "30");
 	lidar_bp.SetAttribute("points_per_second", "500000");
 
 	auto user_offset = cg::Location(0, 0, 0);
@@ -127,6 +131,7 @@ int main(){
 	auto lidar_actor = world.SpawnActor(lidar_bp, lidar_transform, ego_actor.get());
 	auto lidar = boost::static_pointer_cast<cc::Sensor>(lidar_actor);
 	bool new_scan = true;
+	std::mutex scan_mutex;
 	std::chrono::time_point<std::chrono::system_clock> lastScanTime, startTime;
 
 	pcl::visualization::PCLVisualizer::Ptr viewer (new pcl::visualization::PCLVisualizer ("3D Viewer"));
@@ -139,35 +144,41 @@ int main(){
 	// Load map
 	PointCloudT::Ptr mapCloud(new PointCloudT);
   	pcl::io::loadPCDFile("map.pcd", *mapCloud);
+	std::vector<int> mapIndices;
+	pcl::removeNaNFromPointCloud(*mapCloud, *mapCloud, mapIndices);
   	cout << "Loaded " << mapCloud->points.size() << " data points from map.pcd" << endl;
 	renderPointCloud(viewer, mapCloud, "map", Color(0,0,1)); 
 
 	typename pcl::PointCloud<PointT>::Ptr cloudFiltered (new pcl::PointCloud<PointT>);
 	typename pcl::PointCloud<PointT>::Ptr scanCloud (new pcl::PointCloud<PointT>);
 	typename pcl::PointCloud<PointT>::Ptr alignedCloud (new pcl::PointCloud<PointT>);
-	// NDT is configured once and reused each frame to avoid repeated allocator/setup overhead.
-	// The target is the static map point cloud; each incoming scan becomes the source.
-	pcl::NormalDistributionsTransform<PointT, PointT> ndt;
-	ndt.setInputTarget(mapCloud);
-	// Resolution controls voxel size of NDT cells in meters.
-	ndt.setResolution(1.0);
-	// Step size limits line-search updates during optimization.
-	ndt.setStepSize(0.1);
-	// Stop when transform update between iterations is sufficiently small.
-	ndt.setTransformationEpsilon(0.01);
-	// Hard cap for runtime per scan match.
-	ndt.setMaximumIterations(20);
+	typename pcl::PointCloud<PointT>::Ptr transformedScan (new pcl::PointCloud<PointT>);
+	typename pcl::PointCloud<PointT>::Ptr localMapX (new pcl::PointCloud<PointT>);
+	typename pcl::PointCloud<PointT>::Ptr localMapCloud (new pcl::PointCloud<PointT>);
+	// Keep ICP object alive across frames to avoid repeated setup cost.
+	pcl::IterativeClosestPoint<PointT, PointT> icp;
+	icp.setMaximumIterations(7);
+	icp.setMaxCorrespondenceDistance(1.8);
+	icp.setTransformationEpsilon(5e-4);
+	icp.setEuclideanFitnessEpsilon(2e-3);
 
-	lidar->Listen([&new_scan, &lastScanTime, &scanCloud](auto data){
+	lidar->Listen([&new_scan, &scan_mutex, &lastScanTime, &scanCloud](auto data){
 
+		std::lock_guard<std::mutex> lock(scan_mutex);
 		if(new_scan){
 			auto scan = boost::static_pointer_cast<csd::LidarMeasurement>(data);
 			for (auto detection : *scan){
 				if((detection.x*detection.x + detection.y*detection.y + detection.z*detection.z) > 8.0){
-					pclCloud.points.push_back(PointT(detection.x, detection.y, detection.z));
+					// CARLA lidar axes to project/map convention used by this project.
+					const float px = -detection.y;
+					const float py = detection.x;
+					const float pz = -detection.z;
+					if (std::isfinite(px) && std::isfinite(py) && std::isfinite(pz)) {
+						pclCloud.points.push_back(PointT(px, py, pz));
+					}
 				}
 			}
-			if(pclCloud.points.size() > 5000){ // CANDO: Can modify this value to get different scan resolutions
+			if(pclCloud.points.size() > 2200){ // Batch size for each scan-matching update.
 				lastScanTime = std::chrono::system_clock::now();
 				*scanCloud = pclCloud;
 				new_scan = false;
@@ -180,7 +191,15 @@ int main(){
 
 	while (!viewer->wasStopped())
   	{
-		while(new_scan){
+		while(true){
+			bool waiting_scan = true;
+			{
+				std::lock_guard<std::mutex> lock(scan_mutex);
+				waiting_scan = new_scan;
+			}
+			if(!waiting_scan){
+				break;
+			}
 			std::this_thread::sleep_for(0.1s);
 			world.Tick(1s);
 		}
@@ -210,18 +229,35 @@ int main(){
 
   		viewer->spinOnce ();
 		
-		if(!new_scan){
-			
-			new_scan = true;
-			// TODO: Voxel downsample the incoming scan before scan matching for speed and robustness.
-			pcl::VoxelGrid<PointT> voxelFilter;
-			voxelFilter.setInputCloud(scanCloud);
-			voxelFilter.setLeafSize(0.2f, 0.2f, 0.2f);
-			voxelFilter.filter(*cloudFiltered);
-			scanCloud.swap(cloudFiltered);
+		bool has_scan = false;
+		{
+			std::lock_guard<std::mutex> lock(scan_mutex);
+			has_scan = !new_scan;
+		}
+		if(has_scan){
+			PointCloudT::Ptr currentScan(new PointCloudT);
+			{
+				std::lock_guard<std::mutex> lock(scan_mutex);
+				*currentScan = *scanCloud;
+				new_scan = true;
+				pclCloud.points.clear();
+			}
 
-			// Build an initial transform guess from the previous pose estimate.
-			// A good seed reduces NDT iterations and prevents local minima.
+			std::vector<int> scanIndices;
+			pcl::removeNaNFromPointCloud(*currentScan, *currentScan, scanIndices);
+			if(currentScan->empty()){
+				continue;
+			}
+
+			// Downsample the raw scan to keep registration fast and reduce noise.
+			pcl::VoxelGrid<PointT> voxelFilter;
+			voxelFilter.setInputCloud(currentScan);
+			voxelFilter.setLeafSize(0.50f, 0.50f, 0.50f);
+			voxelFilter.filter(*cloudFiltered);
+			currentScan.swap(cloudFiltered);
+
+			// Build the initial registration guess from the last estimated pose.
+			// A strong seed improves convergence speed and stability.
 			Eigen::Matrix4f initialGuess = Eigen::Matrix4f::Identity();
 			const float cy = static_cast<float>(cos(pose.rotation.yaw));
 			const float sy = static_cast<float>(sin(pose.rotation.yaw));
@@ -233,25 +269,45 @@ int main(){
 			initialGuess(1, 3) = static_cast<float>(pose.position.y);
 			initialGuess(2, 3) = static_cast<float>(pose.position.z);
 
-			// Align current lidar scan (source) to map (target) using NDT.
-			// alignedCloud receives the transformed source points.
-			ndt.setInputSource(scanCloud);
-			ndt.align(*alignedCloud, initialGuess);
-			const bool ndtConverged = ndt.hasConverged();
-			if (ndtConverged) {
-				// Convert the final transform matrix into pose components used by the simulator.
-				const Eigen::Matrix4f transform = ndt.getFinalTransformation();
-				pose.position.x = transform(0, 3);
-				pose.position.y = transform(1, 3);
-				pose.position.z = transform(2, 3);
-				pose.rotation.yaw = atan2(transform(1, 0), transform(0, 0));
+			// Crop a local map window around the current estimate so ICP matches faster and more reliably.
+			pcl::PassThrough<PointT> passX;
+			passX.setInputCloud(mapCloud);
+			passX.setFilterFieldName("x");
+			passX.setFilterLimits(initialGuess(0, 3) - 35.0f, initialGuess(0, 3) + 35.0f);
+			passX.filter(*localMapX);
+
+			pcl::PassThrough<PointT> passY;
+			passY.setInputCloud(localMapX);
+			passY.setFilterFieldName("y");
+			passY.setFilterLimits(initialGuess(1, 3) - 35.0f, initialGuess(1, 3) + 35.0f);
+			passY.filter(*localMapCloud);
+
+			if(localMapCloud->size() < 2000){
+				*localMapCloud = *mapCloud;
 			}
 
-			// TODO: Transform scan so it aligns with ego's actual pose and render that scan
+			// Run ICP from the predicted pose and keep only numerically stable results.
+			icp.setInputTarget(localMapCloud);
+			icp.setInputSource(currentScan);
+			icp.align(*alignedCloud, initialGuess);
+			const bool icpConverged = icp.hasConverged();
+			const double icpFitness = icp.getFitnessScore();
+			const bool icpValid = icpConverged && std::isfinite(icpFitness) && icpFitness < 2.5;
+
+			Eigen::Matrix4f matchTransform = initialGuess;
+			if (icpValid) {
+				matchTransform = icp.getFinalTransformation();
+			}
+
+			pose.position.x = matchTransform(0, 3);
+			pose.position.y = matchTransform(1, 3);
+			pose.position.z = matchTransform(2, 3);
+			pose.rotation.yaw = atan2(matchTransform(1, 0), matchTransform(0, 0));
+
+			// Step 3: Render scan points in map frame using the accepted transform.
+			pcl::transformPointCloud(*currentScan, *transformedScan, matchTransform);
 			viewer->removePointCloud("scan");
-			
-			// TODO: Change `scanCloud` below to your transformed scan
-			renderPointCloud(viewer, ndtConverged ? alignedCloud : scanCloud, "scan", Color(1,0,0) );
+			renderPointCloud(viewer, transformedScan, "scan", Color(1,0,0) );
 
 			viewer->removeAllShapes();
 			drawCar(pose, 1,  Color(0,1,0), 0.35, viewer);
@@ -276,8 +332,6 @@ int main(){
 				viewer->addText("Passed!", 200, 50, 32, 0.0, 1.0, 0.0, "eval",0);
 			}
 		}
-
-			pclCloud.points.clear();
 		}
   	}
 	return 0;
